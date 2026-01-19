@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
-	"strings"
+	"path/filepath"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/ledongthuc/pdf"
@@ -18,73 +20,70 @@ import (
 
 var (
 	collectionName = "pdf_collection"
+	aiClient       *openai.Client
+	qdrantClient   pb.PointsClient
 )
 
 func main() {
-	// 1. Load API Key
-	if err := godotenv.Load(); err != nil {
-		log.Fatal("Error loading .env file")
-	}
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	aiClient := openai.NewClient(apiKey)
+	// 1. Setup Environment & Clients
+	setupInfrastructure()
 
-	// 2. Connect to Qdrant
-	conn, err := grpc.NewClient("localhost:6334", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("Did not connect to Qdrant: %v", err)
-	}
-	defer conn.Close()
-	qdrantClient := pb.NewPointsClient(conn)
+	// 2. Setup Web Server (Gin)
+	r := gin.Default()
 
-	// 3. DECIDE: Are we teaching (Ingest) or asking (Chat)?
-	args := os.Args[1:]
-	if len(args) > 0 {
-		// User provided a question -> "Chat Mode"
-		question := strings.Join(args, " ")
-		runChat(aiClient, qdrantClient, question)
-	} else {
-		// No arguments -> "Ingest Mode"
-		runIngest(aiClient, qdrantClient)
-	}
+	// 3. Define the Routes (The API Endpoints)
+	r.POST("/ingest", handleIngest)
+	r.POST("/chat", handleChat)
+
+	// 4. Start the Server
+	fmt.Println("🚀 Server running on http://localhost:8080")
+	r.Run(":8080")
 }
 
-// --- MODE 1: CHAT ---
-func runChat(aiClient *openai.Client, qdrantClient pb.PointsClient, question string) {
-	fmt.Printf("❓ Question: %s\n", question)
-
-	// 1. Convert Question to Vector
-	resp, err := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
-		Input: []string{question},
-		Model: openai.SmallEmbedding3,
-	})
-	if err != nil {
-		log.Fatalf("OpenAI Error: %v", err)
-	}
-	questionVector := resp.Data[0].Embedding
-
-	// 2. Search Qdrant for the "Nearest" text chunk
-	searchResult, err := qdrantClient.Search(context.Background(), &pb.SearchPoints{
-		CollectionName: collectionName,
-		Vector:         questionVector,
-		Limit:          1, // We only want the BEST match
-		WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
-	})
-	if err != nil {
-		log.Fatalf("Search Error: %v", err)
+// --- HANDLER 1: Chat ---
+// Accepts JSON: {"question": "..."}
+// Returns JSON: {"answer": "..."}
+func handleChat(c *gin.Context) {
+	var body struct {
+		Question string `json:"question"`
 	}
 
-	if len(searchResult.Result) == 0 {
-		fmt.Println("❌ No relevant information found in the PDF.")
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 		return
 	}
 
-	// 3. Extract the text found in the database
-	foundText := searchResult.Result[0].Payload["text"].GetStringValue()
-	score := searchResult.Result[0].Score
-	fmt.Printf("🔎 Found context (Similarity: %.2f)\n", score)
+	// 1. Vectorize Question
+	resp, err := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
+		Input: []string{body.Question},
+		Model: openai.SmallEmbedding3,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "OpenAI Error: " + err.Error()})
+		return
+	}
+	questionVector := resp.Data[0].Embedding
 
-	// 4. Send to OpenAI to generate the final answer
-	prompt := fmt.Sprintf("Context: %s\n\nQuestion: %s\n\nAnswer the question based ONLY on the context above.", foundText, question)
+	// 2. Search Qdrant
+	searchResult, err := qdrantClient.Search(context.Background(), &pb.SearchPoints{
+		CollectionName: collectionName,
+		Vector:         questionVector,
+		Limit:          1,
+		WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qdrant Error: " + err.Error()})
+		return
+	}
+
+	if len(searchResult.Result) == 0 {
+		c.JSON(http.StatusOK, gin.H{"answer": "I don't have enough information to answer that."})
+		return
+	}
+
+	// 3. Generate Answer
+	foundText := searchResult.Result[0].Payload["text"].GetStringValue()
+	prompt := fmt.Sprintf("Context: %s\n\nQuestion: %s\n\nAnswer based ONLY on the context.", foundText, body.Question)
 
 	chatResp, err := aiClient.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
 		Model: openai.GPT3Dot5Turbo,
@@ -93,33 +92,51 @@ func runChat(aiClient *openai.Client, qdrantClient pb.PointsClient, question str
 		},
 	})
 	if err != nil {
-		log.Fatalf("Chat Error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Chat Error: " + err.Error()})
+		return
 	}
 
-	fmt.Println("\n🤖 AI Answer:")
-	fmt.Println(chatResp.Choices[0].Message.Content)
+	c.JSON(http.StatusOK, gin.H{
+		"answer":  chatResp.Choices[0].Message.Content,
+		"context": foundText,
+	})
 }
 
-// --- MODE 2: INGEST ---
-func runIngest(aiClient *openai.Client, qdrantClient pb.PointsClient) {
-	fmt.Println("📄 Reading PDF...")
-	content, err := readPdf("sample.pdf")
+// --- HANDLER 2: Ingest ---
+// Accepts Multipart Form: file="resume.pdf"
+func handleIngest(c *gin.Context) {
+	file, err := c.FormFile("file")
 	if err != nil {
-		log.Fatalf("Error: %v (Is sample.pdf here?)", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
+		return
 	}
-	fmt.Printf("   Found %d characters.\n", len(content))
 
-	fmt.Println("🧠 Generating Vector...")
+	// Save file temporarily
+	tempPath := filepath.Join(".", file.Filename)
+	if err := c.SaveUploadedFile(file, tempPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not save file"})
+		return
+	}
+	defer os.Remove(tempPath) // Cleanup after we are done
+
+	// Read & Embed
+	content, err := readPdf(tempPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not read PDF"})
+		return
+	}
+
 	resp, err := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
 		Input: []string{content},
 		Model: openai.SmallEmbedding3,
 	})
 	if err != nil {
-		log.Fatalf("OpenAI Error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "OpenAI Error"})
+		return
 	}
 	vector := resp.Data[0].Embedding
 
-	fmt.Println("💾 Saving to Qdrant...")
+	// Store
 	upsertReq := &pb.UpsertPoints{
 		CollectionName: collectionName,
 		Points: []*pb.PointStruct{
@@ -130,11 +147,23 @@ func runIngest(aiClient *openai.Client, qdrantClient pb.PointsClient) {
 			},
 		},
 	}
-	_, err = qdrantClient.Upsert(context.Background(), upsertReq)
-	if err != nil {
-		log.Fatalf("Qdrant Error: %v", err)
+	qdrantClient.Upsert(context.Background(), upsertReq)
+
+	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "File ingested successfully", "chars": len(content)})
+}
+
+// --- HELPERS ---
+func setupInfrastructure() {
+	if err := godotenv.Load(); err != nil {
+		log.Fatal("Error loading .env file")
 	}
-	fmt.Println("🚀 Success! PDF Learned.")
+	aiClient = openai.NewClient(os.Getenv("OPENAI_API_KEY"))
+
+	conn, err := grpc.NewClient("localhost:6334", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Did not connect to Qdrant: %v", err)
+	}
+	qdrantClient = pb.NewPointsClient(conn)
 }
 
 func readPdf(path string) (string, error) {
