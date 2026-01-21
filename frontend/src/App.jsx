@@ -1,6 +1,9 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import axios from "axios";
 import "./App.css";
+
+// AUTOMATIC SWITCH: Uses Cloud URL if set, otherwise falls back to localhost
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8080";
 
 function App() {
   const [file, setFile] = useState(null);
@@ -8,8 +11,12 @@ function App() {
   const [chatHistory, setChatHistory] = useState([]);
   const [loading, setLoading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState("");
+  const chatEndRef = useRef(null);
 
-  // 1. Handle File Upload
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatHistory]);
+
   const handleUpload = async () => {
     if (!file) return;
     setUploadStatus("Uploading...");
@@ -18,32 +25,29 @@ function App() {
     formData.append("file", file);
 
     try {
-      await axios.post("http://localhost:8080/ingest", formData, {
+      await axios.post(`${API_URL}/ingest`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
-      setUploadStatus("✅ Upload Success! You can now chat.");
+      setUploadStatus("✅ Ready to chat!");
     } catch (error) {
       console.error(error);
-      setUploadStatus("❌ Upload Failed. Is the Go server running?");
+      setUploadStatus("❌ Upload Failed");
     }
   };
 
-  // 2. Handle Chat Message
   const handleChat = async () => {
-    if (!question) return;
+    if (!question.trim()) return;
 
-    // Add user message to UI immediately
     const userMessage = { role: "user", content: question };
     setChatHistory((prev) => [...prev, userMessage]);
     setQuestion("");
     setLoading(true);
 
     try {
-      const res = await axios.post("http://localhost:8080/chat", {
+      const res = await axios.post(`${API_URL}/chat`, {
         question: userMessage.content,
       });
 
-      // Add AI response to UI
       const aiMessage = { role: "ai", content: res.data.answer };
       setChatHistory((prev) => [...prev, aiMessage]);
     } catch (error) {
@@ -56,49 +60,44 @@ function App() {
   };
 
   return (
-    <div style={{ maxWidth: "600px", margin: "0 auto", padding: "20px", fontFamily: "Arial" }}>
-      <h1>🤖 Go-DocuChat</h1>
+    <div className="app-container">
+      <header>
+        <h1>🤖 DocuChat V2</h1>
+      </header>
       
-      {/* Upload Section */}
-      <div style={{ marginBottom: "20px", padding: "15px", border: "1px solid #ccc", borderRadius: "8px" }}>
-        <h3>1. Upload Knowledge</h3>
-        <input type="file" onChange={(e) => setFile(e.target.files[0])} />
-        <button onClick={handleUpload} style={{ marginLeft: "10px" }}>Upload PDF</button>
-        <p style={{ marginTop: "10px", fontWeight: "bold" }}>{uploadStatus}</p>
+      <div className="upload-section">
+        <input type="file" className="file-input" onChange={(e) => setFile(e.target.files[0])} />
+        <button className="upload-btn" onClick={handleUpload}>Upload PDF</button>
+        {uploadStatus && <span className="status-text">{uploadStatus}</span>}
       </div>
 
-      {/* Chat Section */}
-      <div style={{ border: "1px solid #ccc", borderRadius: "8px", padding: "15px", height: "400px", overflowY: "scroll", background: "#f9f9f9" }}>
-        {chatHistory.length === 0 && <p style={{ color: "#888", textAlign: "center" }}>Ask a question about your PDF...</p>}
-        
-        {chatHistory.map((msg, index) => (
-          <div key={index} style={{ textAlign: msg.role === "user" ? "right" : "left", marginBottom: "10px" }}>
-            <div style={{ 
-              display: "inline-block", 
-              padding: "10px", 
-              borderRadius: "10px", 
-              background: msg.role === "user" ? "#007bff" : "#e0e0e0", 
-              color: msg.role === "user" ? "#fff" : "#000",
-              maxWidth: "80%"
-            }}>
-              {msg.content}
-            </div>
+      <div className="chat-window">
+        {chatHistory.length === 0 ? (
+          <div className="empty-state">
+            <p>Upload a document to get started.</p>
           </div>
-        ))}
-        {loading && <p>Thinking...</p>}
+        ) : (
+          chatHistory.map((msg, index) => (
+            <div key={index} className={`message ${msg.role}`}>
+              <div className="bubble">{msg.content}</div>
+            </div>
+          ))
+        )}
+        {loading && <div className="message ai"><div className="bubble">Thinking...</div></div>}
+        <div ref={chatEndRef} />
       </div>
 
-      {/* Input Section */}
-      <div style={{ marginTop: "20px", display: "flex" }}>
+      <div className="input-area">
         <input 
           type="text" 
+          className="chat-input"
           value={question} 
           onChange={(e) => setQuestion(e.target.value)} 
           onKeyPress={(e) => e.key === 'Enter' && handleChat()}
-          placeholder="Type your question..." 
-          style={{ flex: 1, padding: "10px", borderRadius: "5px", border: "1px solid #ccc" }} 
+          placeholder="Ask a question..." 
+          disabled={loading}
         />
-        <button onClick={handleChat} style={{ marginLeft: "10px", padding: "10px 20px" }}>Send</button>
+        <button className="send-btn" onClick={handleChat} disabled={loading}>Send</button>
       </div>
     </div>
   );
