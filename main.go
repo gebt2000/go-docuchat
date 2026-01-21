@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	pb "github.com/qdrant/go-client/qdrant"
 	"github.com/sashabaranov/go-openai"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -30,17 +32,22 @@ func main() {
 
 	r := gin.Default()
 
-	// --- CORS CONFIGURATION (Allows React to talk to Go) ---
+	// --- CORS CONFIGURATION ---
 	config := cors.DefaultConfig()
 	config.AllowAllOrigins = true
 	r.Use(cors.New(config))
-	// ------------------------------------------------------
+	// --------------------------
 
 	r.POST("/ingest", handleIngest)
 	r.POST("/chat", handleChat)
 
-	fmt.Println("🚀 Server running on http://localhost:8080")
-	r.Run(":8080")
+	// CLOUD PORT CONFIGURATION
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	fmt.Println("🚀 Server running on port " + port)
+	r.Run(":" + port)
 }
 
 func handleChat(c *gin.Context) {
@@ -143,15 +150,47 @@ func handleIngest(c *gin.Context) {
 }
 
 func setupInfrastructure() {
-	if err := godotenv.Load(); err != nil {
-		log.Fatal("Error loading .env file")
-	}
+	// FIX: Load .env if it exists, but DO NOT CRASH if it is missing
+	godotenv.Load() 
+
 	aiClient = openai.NewClient(os.Getenv("OPENAI_API_KEY"))
-	conn, err := grpc.NewClient("localhost:6334", grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	qdrantURL := os.Getenv("QDRANT_URL")
+	qdrantKey := os.Getenv("QDRANT_API_KEY")
+
+	if qdrantURL == "" {
+		qdrantURL = "localhost:6334"
+	}
+
+	var conn *grpc.ClientConn
+	var err error
+
+	if qdrantKey == "" {
+		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		// Secure Cloud Connection
+		conn, err = grpc.NewClient(qdrantURL, 
+			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+			grpc.WithPerRPCCredentials(tokenAuth{token: qdrantKey}),
+		)
+	}
+
 	if err != nil {
 		log.Fatalf("Did not connect to Qdrant: %v", err)
 	}
 	qdrantClient = pb.NewPointsClient(conn)
+}
+
+type tokenAuth struct {
+	token string
+}
+
+func (t tokenAuth) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{"api-key": t.token}, nil
+}
+
+func (t tokenAuth) RequireTransportSecurity() bool {
+	return true
 }
 
 func readPdf(path string) (string, error) {
