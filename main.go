@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -25,46 +26,42 @@ var (
 )
 
 func main() {
-	// 1. Setup Environment & Clients
 	setupInfrastructure()
 
-	// 2. Setup Web Server (Gin)
 	r := gin.Default()
 
-	// 3. Define the Routes (The API Endpoints)
+	// --- CORS CONFIGURATION (Allows React to talk to Go) ---
+	config := cors.DefaultConfig()
+	config.AllowAllOrigins = true
+	r.Use(cors.New(config))
+	// ------------------------------------------------------
+
 	r.POST("/ingest", handleIngest)
 	r.POST("/chat", handleChat)
 
-	// 4. Start the Server
 	fmt.Println("🚀 Server running on http://localhost:8080")
 	r.Run(":8080")
 }
 
-// --- HANDLER 1: Chat ---
-// Accepts JSON: {"question": "..."}
-// Returns JSON: {"answer": "..."}
 func handleChat(c *gin.Context) {
 	var body struct {
 		Question string `json:"question"`
 	}
-
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 		return
 	}
 
-	// 1. Vectorize Question
 	resp, err := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
 		Input: []string{body.Question},
 		Model: openai.SmallEmbedding3,
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "OpenAI Error: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "OpenAI Error"})
 		return
 	}
 	questionVector := resp.Data[0].Embedding
 
-	// 2. Search Qdrant
 	searchResult, err := qdrantClient.Search(context.Background(), &pb.SearchPoints{
 		CollectionName: collectionName,
 		Vector:         questionVector,
@@ -72,16 +69,15 @@ func handleChat(c *gin.Context) {
 		WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qdrant Error: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qdrant Error"})
 		return
 	}
 
 	if len(searchResult.Result) == 0 {
-		c.JSON(http.StatusOK, gin.H{"answer": "I don't have enough information to answer that."})
+		c.JSON(http.StatusOK, gin.H{"answer": "No context found."})
 		return
 	}
 
-	// 3. Generate Answer
 	foundText := searchResult.Result[0].Payload["text"].GetStringValue()
 	prompt := fmt.Sprintf("Context: %s\n\nQuestion: %s\n\nAnswer based ONLY on the context.", foundText, body.Question)
 
@@ -92,7 +88,7 @@ func handleChat(c *gin.Context) {
 		},
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Chat Error: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Chat Error"})
 		return
 	}
 
@@ -102,24 +98,19 @@ func handleChat(c *gin.Context) {
 	})
 }
 
-// --- HANDLER 2: Ingest ---
-// Accepts Multipart Form: file="resume.pdf"
 func handleIngest(c *gin.Context) {
 	file, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
 		return
 	}
-
-	// Save file temporarily
 	tempPath := filepath.Join(".", file.Filename)
 	if err := c.SaveUploadedFile(file, tempPath); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not save file"})
 		return
 	}
-	defer os.Remove(tempPath) // Cleanup after we are done
+	defer os.Remove(tempPath)
 
-	// Read & Embed
 	content, err := readPdf(tempPath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not read PDF"})
@@ -136,7 +127,6 @@ func handleIngest(c *gin.Context) {
 	}
 	vector := resp.Data[0].Embedding
 
-	// Store
 	upsertReq := &pb.UpsertPoints{
 		CollectionName: collectionName,
 		Points: []*pb.PointStruct{
@@ -149,16 +139,14 @@ func handleIngest(c *gin.Context) {
 	}
 	qdrantClient.Upsert(context.Background(), upsertReq)
 
-	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "File ingested successfully", "chars": len(content)})
+	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "File ingested"})
 }
 
-// --- HELPERS ---
 func setupInfrastructure() {
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file")
 	}
 	aiClient = openai.NewClient(os.Getenv("OPENAI_API_KEY"))
-
 	conn, err := grpc.NewClient("localhost:6334", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Did not connect to Qdrant: %v", err)
