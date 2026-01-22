@@ -23,9 +23,10 @@ import (
 )
 
 var (
-	collectionName = "pdf_collection"
-	aiClient       *openai.Client
-	qdrantClient   pb.PointsClient
+	collectionName    = "pdf_collection"
+	aiClient          *openai.Client
+	qdrantClient      pb.PointsClient
+	collectionsClient pb.CollectionsClient // <--- NEW: Added this specific client
 )
 
 func main() {
@@ -82,7 +83,6 @@ func handleChat(c *gin.Context) {
 		WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
 	})
 	if err != nil {
-		// If collection is missing, tell user to upload first
 		log.Printf("❌ Search Error: %v", err)
 		c.JSON(http.StatusOK, gin.H{"answer": "⚠️ I don't have any knowledge yet! Please Upload a PDF first to create the database."})
 		return
@@ -138,8 +138,8 @@ func handleIngest(c *gin.Context) {
 		return
 	}
 	
-	// RESTORED: Check/Create Collection (Ignores error if already exists)
-	qdrantClient.CreateCollection(context.Background(), &pb.CreateCollection{
+	// FIX: Use collectionsClient to create the collection
+	collectionsClient.Create(context.Background(), &pb.CreateCollection{
 		CollectionName: collectionName,
 		VectorsConfig: &pb.VectorsConfig{Config: &pb.VectorsConfig_Params{Params: &pb.VectorParams{
 			Size: 1536,
@@ -175,11 +175,12 @@ func setupInfrastructure() {
 	if os.Getenv("QDRANT_API_KEY") == "" {
 		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		// Use TLS for Cloud
 		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})), grpc.WithPerRPCCredentials(tokenAuth{token: os.Getenv("QDRANT_API_KEY")}))
 	}
 	if err != nil { log.Fatalf("Qdrant Connect Error: %v", err) }
+	
 	qdrantClient = pb.NewPointsClient(conn)
+	collectionsClient = pb.NewCollectionsClient(conn) // <--- FIX: Initialize the new client
 }
 
 type tokenAuth struct { token string }
