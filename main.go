@@ -31,17 +31,13 @@ func main() {
 	setupInfrastructure()
 
 	r := gin.Default()
-
-	// --- CORS CONFIGURATION ---
 	config := cors.DefaultConfig()
 	config.AllowAllOrigins = true
 	r.Use(cors.New(config))
-	// --------------------------
 
 	r.POST("/ingest", handleIngest)
 	r.POST("/chat", handleChat)
 
-	// CLOUD PORT CONFIGURATION
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -59,16 +55,19 @@ func handleChat(c *gin.Context) {
 		return
 	}
 
+	// 1. EMBEDDING STEP
 	resp, err := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
 		Input: []string{body.Question},
 		Model: openai.SmallEmbedding3,
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "OpenAI Error"})
+		fmt.Printf("❌ OpenAI Embedding Error: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("OpenAI Embedding Error: %v", err)})
 		return
 	}
 	questionVector := resp.Data[0].Embedding
 
+	// 2. QDRANT SEARCH STEP
 	searchResult, err := qdrantClient.Search(context.Background(), &pb.SearchPoints{
 		CollectionName: collectionName,
 		Vector:         questionVector,
@@ -76,18 +75,21 @@ func handleChat(c *gin.Context) {
 		WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Qdrant Error"})
+		fmt.Printf("❌ Qdrant Search Error: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Qdrant Search Error: %v", err)})
 		return
 	}
 
 	if len(searchResult.Result) == 0 {
-		c.JSON(http.StatusOK, gin.H{"answer": "No context found."})
+		c.JSON(http.StatusOK, gin.H{"answer": "I couldn't find any relevant info in the document."})
 		return
 	}
 
 	foundText := searchResult.Result[0].Payload["text"].GetStringValue()
+	
+	// 3. CHAT COMPLETION STEP
 	prompt := fmt.Sprintf("Context: %s\n\nQuestion: %s\n\nAnswer based ONLY on the context.", foundText, body.Question)
-
+	
 	chatResp, err := aiClient.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
 		Model: openai.GPT3Dot5Turbo,
 		Messages: []openai.ChatCompletionMessage{
@@ -95,7 +97,8 @@ func handleChat(c *gin.Context) {
 		},
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Chat Error"})
+		fmt.Printf("❌ OpenAI Chat Error: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("OpenAI Chat Error: %v", err)})
 		return
 	}
 
@@ -112,15 +115,12 @@ func handleIngest(c *gin.Context) {
 		return
 	}
 	tempPath := filepath.Join(".", file.Filename)
-	if err := c.SaveUploadedFile(file, tempPath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not save file"})
-		return
-	}
+	c.SaveUploadedFile(file, tempPath)
 	defer os.Remove(tempPath)
 
 	content, err := readPdf(tempPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not read PDF"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "PDF Read Error"})
 		return
 	}
 
@@ -129,38 +129,47 @@ func handleIngest(c *gin.Context) {
 		Model: openai.SmallEmbedding3,
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "OpenAI Error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Embedding Error: %v", err)})
 		return
 	}
-	vector := resp.Data[0].Embedding
+	
+	// Create Collection if not exists (Lazy fix)
+	qdrantClient.CreateCollection(context.Background(), &pb.CreateCollection{
+		CollectionName: collectionName,
+		VectorsConfig: &pb.VectorsConfig{Config: &pb.VectorsConfig_Params{Params: &pb.VectorParams{
+			Size: 1536,
+			Distance: pb.Distance_Cosine,
+		}}},
+	})
 
 	upsertReq := &pb.UpsertPoints{
 		CollectionName: collectionName,
 		Points: []*pb.PointStruct{
 			{
 				Id: &pb.PointId{PointIdOptions: &pb.PointId_Uuid{Uuid: uuid.New().String()}},
-				Vectors: &pb.Vectors{VectorsOptions: &pb.Vectors_Vector{Vector: &pb.Vector{Data: vector}}},
+				Vectors: &pb.Vectors{VectorsOptions: &pb.Vectors_Vector{Vector: &pb.Vector{Data: resp.Data[0].Embedding}}},
 				Payload: map[string]*pb.Value{"text": {Kind: &pb.Value_StringValue{StringValue: content}}},
 			},
 		},
 	}
-	qdrantClient.Upsert(context.Background(), upsertReq)
+	_, err = qdrantClient.Upsert(context.Background(), upsertReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Qdrant Upsert Error: %v", err)})
+		return
+	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "File ingested"})
+	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 
 func setupInfrastructure() {
-	// FIX: Load .env if it exists, but DO NOT CRASH if it is missing
 	godotenv.Load() 
-
 	aiClient = openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 
 	qdrantURL := os.Getenv("QDRANT_URL")
 	qdrantKey := os.Getenv("QDRANT_API_KEY")
-
-	if qdrantURL == "" {
-		qdrantURL = "localhost:6334"
-	}
+	
+	// Default to localhost if empty (Safe Mode)
+	if qdrantURL == "" { qdrantURL = "localhost:6334" }
 
 	var conn *grpc.ClientConn
 	var err error
@@ -168,43 +177,30 @@ func setupInfrastructure() {
 	if qdrantKey == "" {
 		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		// Secure Cloud Connection
 		conn, err = grpc.NewClient(qdrantURL, 
 			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
 			grpc.WithPerRPCCredentials(tokenAuth{token: qdrantKey}),
 		)
 	}
 
-	if err != nil {
-		log.Fatalf("Did not connect to Qdrant: %v", err)
-	}
+	if err != nil { log.Fatalf("Qdrant Connect Error: %v", err) }
 	qdrantClient = pb.NewPointsClient(conn)
 }
 
-type tokenAuth struct {
-	token string
-}
-
+type tokenAuth struct { token string }
 func (t tokenAuth) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
 	return map[string]string{"api-key": t.token}, nil
 }
-
-func (t tokenAuth) RequireTransportSecurity() bool {
-	return true
-}
+func (t tokenAuth) RequireTransportSecurity() bool { return true }
 
 func readPdf(path string) (string, error) {
 	f, r, err := pdf.Open(path)
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 	defer f.Close()
 	var totalText string
 	for pageIndex := 1; pageIndex <= r.NumPage(); pageIndex++ {
 		p := r.Page(pageIndex)
-		if p.V.IsNull() {
-			continue
-		}
+		if p.V.IsNull() { continue }
 		text, _ := p.GetPlainText(nil)
 		totalText += text
 	}
