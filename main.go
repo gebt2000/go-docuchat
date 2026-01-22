@@ -85,7 +85,14 @@ func handleChat(c *gin.Context) {
 		return
 	}
 
-	foundText := searchResult.Result[0].Payload["text"].GetStringValue()
+	// SAFETY CHECK: Handle missing payload
+	payloadItem, ok := searchResult.Result[0].Payload["text"]
+	if !ok || payloadItem == nil {
+		fmt.Println("❌ Payload 'text' is missing or nil")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Data missing in database"})
+		return
+	}
+	foundText := payloadItem.GetStringValue()
 	
 	// 3. CHAT COMPLETION STEP
 	prompt := fmt.Sprintf("Context: %s\n\nQuestion: %s\n\nAnswer based ONLY on the context.", foundText, body.Question)
@@ -133,7 +140,6 @@ func handleIngest(c *gin.Context) {
 		return
 	}
 	
-	// Create Collection if not exists (Lazy fix)
 	qdrantClient.CreateCollection(context.Background(), &pb.CreateCollection{
 		CollectionName: collectionName,
 		VectorsConfig: &pb.VectorsConfig{Config: &pb.VectorsConfig_Params{Params: &pb.VectorParams{
@@ -168,7 +174,6 @@ func setupInfrastructure() {
 	qdrantURL := os.Getenv("QDRANT_URL")
 	qdrantKey := os.Getenv("QDRANT_API_KEY")
 	
-	// Default to localhost if empty (Safe Mode)
 	if qdrantURL == "" { qdrantURL = "localhost:6334" }
 
 	var conn *grpc.ClientConn
