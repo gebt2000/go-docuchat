@@ -42,6 +42,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	log.Println("🚀 Server running on port " + port)
 	r.Run(":" + port)
 }
 
@@ -54,7 +55,7 @@ func handleChat(c *gin.Context) {
 		return
 	}
 
-	// 1. Embedding
+	// 1. EMBEDDING
 	resp, err := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
 		Input: []string{body.Question},
 		Model: openai.SmallEmbedding3,
@@ -65,7 +66,7 @@ func handleChat(c *gin.Context) {
 		return
 	}
 
-	// 2. Search
+	// 2. SEARCH
 	searchResult, err := qdrantClient.Search(context.Background(), &pb.SearchPoints{
 		CollectionName: collectionName,
 		Vector:         resp.Data[0].Embedding,
@@ -83,15 +84,14 @@ func handleChat(c *gin.Context) {
 		return
 	}
 	
-	// Safety Check
 	payloadText := ""
 	if item, ok := searchResult.Result[0].Payload["text"]; ok {
 		payloadText = item.GetStringValue()
 	}
 
-	// 3. Chat - UPDATED TO GPT-4o-MINI
+	// 3. CHAT - GPT-4o-MINI (The Fix)
 	chatResp, err := aiClient.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
-		Model: "gpt-4o-mini", // <--- CHANGED THIS
+		Model: "gpt-4o-mini",
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: "Context: " + payloadText + "\n\nQuestion: " + body.Question},
 		},
@@ -117,10 +117,7 @@ func handleIngest(c *gin.Context) {
 		Model: openai.SmallEmbedding3,
 	})
 	
-	qdrantClient.CreateCollection(context.Background(), &pb.CreateCollection{
-		CollectionName: collectionName,
-		VectorsConfig: &pb.VectorsConfig{Config: &pb.VectorsConfig_Params{Params: &pb.VectorParams{Size: 1536, Distance: pb.Distance_Cosine}}},
-	})
+	// Note: We skip CreateCollection because it already exists from your previous successful run.
 
 	qdrantClient.Upsert(context.Background(), &pb.UpsertPoints{
 		CollectionName: collectionName,
@@ -140,11 +137,13 @@ func setupInfrastructure() {
 	if qdrantURL == "" { qdrantURL = "localhost:6334" }
 	
 	var conn *grpc.ClientConn
+	var err error
 	if os.Getenv("QDRANT_API_KEY") == "" {
-		conn, _ = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		conn, _ = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})), grpc.WithPerRPCCredentials(tokenAuth{token: os.Getenv("QDRANT_API_KEY")}))
+		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})), grpc.WithPerRPCCredentials(tokenAuth{token: os.Getenv("QDRANT_API_KEY")}))
 	}
+	if err != nil { log.Fatalf("Qdrant Connect Error: %v", err) }
 	qdrantClient = pb.NewPointsClient(conn)
 }
 
