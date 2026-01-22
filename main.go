@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -47,11 +48,18 @@ func main() {
 }
 
 func handleChat(c *gin.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("🔥 PANIC: %v\nStack: %s", r, string(debug.Stack()))
+			c.JSON(http.StatusOK, gin.H{"answer": fmt.Sprintf("🔥 Server Crash: %v", r)})
+		}
+	}()
+
 	var body struct {
 		Question string `json:"question"`
 	}
 	if err := c.BindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
+		c.JSON(http.StatusOK, gin.H{"answer": "❌ Error: Invalid JSON format."})
 		return
 	}
 
@@ -61,8 +69,8 @@ func handleChat(c *gin.Context) {
 		Model: openai.SmallEmbedding3,
 	})
 	if err != nil {
-		fmt.Printf("❌ Embed Error: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "AI Embedding Failed"})
+		log.Printf("❌ Embedding Error: %v", err)
+		c.JSON(http.StatusOK, gin.H{"answer": fmt.Sprintf("❌ OpenAI Embedding Error: %v", err)})
 		return
 	}
 
@@ -74,13 +82,14 @@ func handleChat(c *gin.Context) {
 		WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
 	})
 	if err != nil {
-		fmt.Printf("❌ Search Error: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database Search Failed"})
+		// If collection is missing, tell user to upload first
+		log.Printf("❌ Search Error: %v", err)
+		c.JSON(http.StatusOK, gin.H{"answer": "⚠️ I don't have any knowledge yet! Please Upload a PDF first to create the database."})
 		return
 	}
 
 	if len(searchResult.Result) == 0 {
-		c.JSON(http.StatusOK, gin.H{"answer": "No relevant info found."})
+		c.JSON(http.StatusOK, gin.H{"answer": "I couldn't find any info in the document matching that question."})
 		return
 	}
 	
@@ -89,7 +98,7 @@ func handleChat(c *gin.Context) {
 		payloadText = item.GetStringValue()
 	}
 
-	// 3. CHAT - GPT-4o-MINI (The Fix)
+	// 3. CHAT (GPT-4o-mini)
 	chatResp, err := aiClient.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
 		Model: "gpt-4o-mini",
 		Messages: []openai.ChatCompletionMessage{
@@ -97,8 +106,8 @@ func handleChat(c *gin.Context) {
 		},
 	})
 	if err != nil {
-		fmt.Printf("❌ Chat Error: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("AI Chat Failed: %v", err)})
+		log.Printf("❌ Chat Error: %v", err)
+		c.JSON(http.StatusOK, gin.H{"answer": fmt.Sprintf("❌ OpenAI Chat Error: %v", err)})
 		return
 	}
 
@@ -106,20 +115,39 @@ func handleChat(c *gin.Context) {
 }
 
 func handleIngest(c *gin.Context) {
-	file, _ := c.FormFile("file")
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"status": "error", "message": "No file uploaded"})
+		return
+	}
 	tempPath := filepath.Join(".", file.Filename)
 	c.SaveUploadedFile(file, tempPath)
 	defer os.Remove(tempPath)
-	content, _ := readPdf(tempPath)
+	content, err := readPdf(tempPath)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"status": "error", "message": "PDF Read Error"})
+		return
+	}
 
-	resp, _ := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
+	resp, err := aiClient.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
 		Input: []string{content},
 		Model: openai.SmallEmbedding3,
 	})
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"status": "error", "message": "Embedding Error: " + err.Error()})
+		return
+	}
 	
-	// Note: We skip CreateCollection because it already exists from your previous successful run.
+	// RESTORED: Check/Create Collection (Ignores error if already exists)
+	qdrantClient.CreateCollection(context.Background(), &pb.CreateCollection{
+		CollectionName: collectionName,
+		VectorsConfig: &pb.VectorsConfig{Config: &pb.VectorsConfig_Params{Params: &pb.VectorParams{
+			Size: 1536,
+			Distance: pb.Distance_Cosine,
+		}}},
+	})
 
-	qdrantClient.Upsert(context.Background(), &pb.UpsertPoints{
+	_, err = qdrantClient.Upsert(context.Background(), &pb.UpsertPoints{
 		CollectionName: collectionName,
 		Points: []*pb.PointStruct{{
 			Id: &pb.PointId{PointIdOptions: &pb.PointId_Uuid{Uuid: uuid.New().String()}},
@@ -127,7 +155,13 @@ func handleIngest(c *gin.Context) {
 			Payload: map[string]*pb.Value{"text": {Kind: &pb.Value_StringValue{StringValue: content}}},
 		}},
 	})
-	c.JSON(http.StatusOK, gin.H{"status": "success"})
+	if err != nil {
+		log.Printf("❌ Upsert Error: %v", err)
+		c.JSON(http.StatusOK, gin.H{"status": "error", "message": "Database Save Failed: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "File processed!"})
 }
 
 func setupInfrastructure() {
@@ -141,6 +175,7 @@ func setupInfrastructure() {
 	if os.Getenv("QDRANT_API_KEY") == "" {
 		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
+		// Use TLS for Cloud
 		conn, err = grpc.NewClient(qdrantURL, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})), grpc.WithPerRPCCredentials(tokenAuth{token: os.Getenv("QDRANT_API_KEY")}))
 	}
 	if err != nil { log.Fatalf("Qdrant Connect Error: %v", err) }
@@ -152,7 +187,8 @@ func (t tokenAuth) GetRequestMetadata(ctx context.Context, uri ...string) (map[s
 func (t tokenAuth) RequireTransportSecurity() bool { return true }
 
 func readPdf(path string) (string, error) {
-	f, r, _ := pdf.Open(path)
+	f, r, err := pdf.Open(path)
+	if err != nil { return "", err }
 	defer f.Close()
 	var totalText string
 	for i := 1; i <= r.NumPage(); i++ { text, _ := r.Page(i).GetPlainText(nil); totalText += text }
