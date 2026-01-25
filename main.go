@@ -26,7 +26,7 @@ var (
 	collectionName    = "pdf_collection"
 	aiClient          *openai.Client
 	qdrantClient      pb.PointsClient
-	collectionsClient pb.CollectionsClient // <--- NEW: Added this specific client
+	collectionsClient pb.CollectionsClient
 )
 
 func main() {
@@ -79,34 +79,29 @@ func handleChat(c *gin.Context) {
 	searchResult, err := qdrantClient.Search(context.Background(), &pb.SearchPoints{
 		CollectionName: collectionName,
 		Vector:         resp.Data[0].Embedding,
-		Limit:          1,
+		Limit:          3, // Context window
 		WithPayload:    &pb.WithPayloadSelector{SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true}},
 	})
-	if err != nil {
-		log.Printf("❌ Search Error: %v", err)
-		c.JSON(http.StatusOK, gin.H{"answer": "⚠️ I don't have any knowledge yet! Please Upload a PDF first to create the database."})
-		return
-	}
-
-	if len(searchResult.Result) == 0 {
-		c.JSON(http.StatusOK, gin.H{"answer": "I couldn't find any info in the document matching that question."})
-		return
-	}
 	
 	payloadText := ""
-	if item, ok := searchResult.Result[0].Payload["text"]; ok {
-		payloadText = item.GetStringValue()
+	if err == nil && len(searchResult.Result) > 0 {
+		if item, ok := searchResult.Result[0].Payload["text"]; ok {
+			payloadText = item.GetStringValue()
+		}
 	}
 
-	// 3. CHAT (GPT-4o-mini)
+	// 3. CHAT (THE PERSONA)
+	systemPrompt := "You are George Barakat's AI Agent. Your job is to impress recruiters. Answer questions about George's skills, experience, and projects enthusiastically using the context provided. If the answer isn't in the context, say 'I don't have that detail handy, but George is a fast learner!'"
+	
+	fullPrompt := fmt.Sprintf("%s\n\nContext from Resume: %s\n\nRecruiter Question: %s", systemPrompt, payloadText, body.Question)
+
 	chatResp, err := aiClient.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
 		Model: "gpt-4o-mini",
 		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleUser, Content: "Context: " + payloadText + "\n\nQuestion: " + body.Question},
+			{Role: openai.ChatMessageRoleUser, Content: fullPrompt},
 		},
 	})
 	if err != nil {
-		log.Printf("❌ Chat Error: %v", err)
 		c.JSON(http.StatusOK, gin.H{"answer": fmt.Sprintf("❌ OpenAI Chat Error: %v", err)})
 		return
 	}
@@ -138,7 +133,6 @@ func handleIngest(c *gin.Context) {
 		return
 	}
 	
-	// FIX: Use collectionsClient to create the collection
 	collectionsClient.Create(context.Background(), &pb.CreateCollection{
 		CollectionName: collectionName,
 		VectorsConfig: &pb.VectorsConfig{Config: &pb.VectorsConfig_Params{Params: &pb.VectorParams{
@@ -147,7 +141,7 @@ func handleIngest(c *gin.Context) {
 		}}},
 	})
 
-	_, err = qdrantClient.Upsert(context.Background(), &pb.UpsertPoints{
+	qdrantClient.Upsert(context.Background(), &pb.UpsertPoints{
 		CollectionName: collectionName,
 		Points: []*pb.PointStruct{{
 			Id: &pb.PointId{PointIdOptions: &pb.PointId_Uuid{Uuid: uuid.New().String()}},
@@ -155,12 +149,6 @@ func handleIngest(c *gin.Context) {
 			Payload: map[string]*pb.Value{"text": {Kind: &pb.Value_StringValue{StringValue: content}}},
 		}},
 	})
-	if err != nil {
-		log.Printf("❌ Upsert Error: %v", err)
-		c.JSON(http.StatusOK, gin.H{"status": "error", "message": "Database Save Failed: " + err.Error()})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "File processed!"})
 }
 
@@ -180,7 +168,7 @@ func setupInfrastructure() {
 	if err != nil { log.Fatalf("Qdrant Connect Error: %v", err) }
 	
 	qdrantClient = pb.NewPointsClient(conn)
-	collectionsClient = pb.NewCollectionsClient(conn) // <--- FIX: Initialize the new client
+	collectionsClient = pb.NewCollectionsClient(conn) 
 }
 
 type tokenAuth struct { token string }
